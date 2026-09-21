@@ -1,0 +1,27 @@
+---
+# ============================================================
+# EKS KUBECONFIG ROLE
+# ============================================================
+# Configures the local kubectl context for the EKS cluster
+# after Terraform has successfully created the cluster.
+# ============================================================
+
+- name: Update kubeconfig for EKS cluster
+  ansible.builtin.command:
+    cmd: >-
+      aws eks update-kubeconfig
+      --region {{ aws_region }}
+      --name {{ eks_cluster_name }}
+      --profile {{ aws_profile }}
+  register: kubeconfig_update
+  changed_when: true
+
+- name: Verify Kubernetes cluster connectivity
+  ansible.builtin.command:
+    cmd: kubectl get nodes
+  register: kubectl_nodes
+  changed_when: false
+
+- name: Display Kubernetes nodes
+  ansible.builtin.debug:
+    var: kubectl_nodes.stdout_lines

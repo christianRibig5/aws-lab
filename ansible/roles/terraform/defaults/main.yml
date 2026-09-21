@@ -1,0 +1,19 @@
+# ============================================================
+# TERRAFORM ROLE - DEFAULT VARIABLES
+# ============================================================
+
+# Terraform component directory.
+# The calling playbook will override this with a component such as:
+# terraform_components.vpc or terraform_components.eks
+terraform_working_dir: ""
+
+# Terraform action requested by the calling playbook.
+# Supported actions will be: plan, apply, destroy
+terraform_action: "plan"
+
+# Run terraform init before the requested action.
+terraform_run_init: true
+
+# Automatically approve apply/destroy operations.
+# Keep false by default as a safety control.
+terraform_auto_approve: false

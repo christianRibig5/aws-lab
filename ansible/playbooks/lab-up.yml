@@ -1,0 +1,111 @@
+---
+# ============================================================
+# AWS LAB - LAB UP
+# ============================================================
+#
+# Orchestrates reusable AWS lab infrastructure
+# in dependency order.
+#
+# Default action: plan
+# Apply must be explicitly requested.
+#
+# Bootstrap is intentionally excluded because the Terraform
+# state bucket is persistent infrastructure.
+# ============================================================
+
+- name: AWS Lab - Terraform Infrastructure
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    # --------------------------------------------------------
+    # 1. VPC
+    # --------------------------------------------------------
+    - name: Terraform - VPC
+      ansible.builtin.include_role:
+        name: terraform
+      vars:
+        terraform_working_dir: "{{ terraform_components.vpc }}"
+        terraform_action: "{{ lab_action | default('plan') }}"
+        terraform_auto_approve: true
+
+    # --------------------------------------------------------
+    # 2. EKS
+    # --------------------------------------------------------
+    - name: Terraform - EKS
+      ansible.builtin.include_role:
+        name: terraform
+      vars:
+        terraform_working_dir: "{{ terraform_components.eks }}"
+        terraform_action: "{{ lab_action | default('plan') }}"
+        terraform_auto_approve: true
+
+    # --------------------------------------------------------
+    # 3. Configure kubectl for EKS
+    # --------------------------------------------------------
+    - name: Configure kubectl for EKS
+      ansible.builtin.include_role:
+        name: eks_kubeconfig
+
+    # --------------------------------------------------------
+    # 4. EKS Pod Identity Agent
+    # --------------------------------------------------------
+    - name: Terraform - EKS Pod Identity Agent
+      ansible.builtin.include_role:
+        name: terraform
+      vars:
+        terraform_working_dir: "{{ terraform_components.pod_identity }}"
+        terraform_action: "{{ lab_action | default('plan') }}"
+        terraform_auto_approve: true
+
+    # --------------------------------------------------------
+    # 5. EBS CSI Driver
+    # --------------------------------------------------------
+    - name: Terraform - EBS CSI Driver
+      ansible.builtin.include_role:
+        name: terraform
+      vars:
+        terraform_working_dir: "{{ terraform_components.ebs }}"
+        terraform_action: "{{ lab_action | default('plan') }}"
+        terraform_auto_approve: true
+
+    # --------------------------------------------------------
+    # 6. Secrets Store CSI Driver - Helm
+    # --------------------------------------------------------
+    - name: Install Secrets Store CSI Driver
+      ansible.builtin.include_role:
+        name: secrets_store_csi
+
+    # --------------------------------------------------------
+    # 7. AWS Secrets Config Provider (ASCP) - Helm
+    # --------------------------------------------------------
+    - name: Install AWS Secrets Config Provider
+      ansible.builtin.include_role:
+        name: ascp
+
+    # --------------------------------------------------------
+    # 8. AWS Load Balancer Controller - IAM and Pod Identity
+    # --------------------------------------------------------
+    - name: Terraform - AWS Load Balancer Controller
+      ansible.builtin.include_role:
+        name: terraform
+      vars:
+        terraform_working_dir: "{{ terraform_components.aws_load_balancer_controller }}"
+        terraform_action: "{{ lab_action }}"
+        terraform_auto_approve: true
+
+    # --------------------------------------------------------
+    # 9. AWS Load Balancer Controller - Helm
+    # --------------------------------------------------------
+    - name: Install AWS Load Balancer Controller
+      ansible.builtin.include_role:
+        name: aws_load_balancer_controller
+        apply:
+          tags:
+            - alb_controller
+      tags:
+        - alb_controller

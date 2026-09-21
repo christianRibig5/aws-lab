@@ -1,0 +1,57 @@
+---
+# ============================================================
+# SECRETS STORE CSI DRIVER
+# ============================================================
+# Installs the Kubernetes Secrets Store CSI Driver using Helm.
+# Configured for AWS EKS Pod Identity.
+# ============================================================
+
+- name: Add Secrets Store CSI Driver Helm repository
+  ansible.builtin.command:
+    cmd: >-
+      helm repo add secrets-store-csi-driver
+      https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts
+      --force-update
+  changed_when: false
+
+- name: Update Helm repositories
+  ansible.builtin.command:
+    cmd: helm repo update
+  changed_when: false
+
+- name: Install or upgrade Secrets Store CSI Driver
+  ansible.builtin.command:
+    cmd: >-
+      helm upgrade --install csi-secrets-store
+      secrets-store-csi-driver/secrets-store-csi-driver
+      --namespace kube-system
+      --set syncSecret.enabled=true
+      --set enableSecretRotation=true
+      --set tokenRequests[0].audience=pods.eks.amazonaws.com
+      --set tokenRequests[0].expirationSeconds=3600
+      --wait
+      --timeout 5m
+  register: secrets_store_install
+
+- name: Verify Secrets Store CSI Driver pods
+  ansible.builtin.command:
+    cmd: >-
+      kubectl get pods
+      -n kube-system
+      -l app=secrets-store-csi-driver
+  register: secrets_store_pods
+  changed_when: false
+
+- name: Display Secrets Store CSI Driver pods
+  ansible.builtin.debug:
+    var: secrets_store_pods.stdout_lines
+
+- name: Verify Secrets Store CSI Driver
+  ansible.builtin.command:
+    cmd: kubectl get csidriver secrets-store.csi.k8s.io
+  register: secrets_store_driver
+  changed_when: false
+
+- name: Display Secrets Store CSI Driver
+  ansible.builtin.debug:
+    var: secrets_store_driver.stdout_lines

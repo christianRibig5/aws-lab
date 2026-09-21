@@ -1,0 +1,33 @@
+---
+# ============================================================
+# AWS LAB - GLOBAL ANSIBLE VARIABLES
+# ============================================================
+
+aws_profile: dev-admin
+aws_region: ca-central-1
+environment_name: dev
+eks_cluster_name: retail-dev-eksjalexsol
+aws_load_balancer_controller_namespace: kube-system
+aws_load_balancer_controller_service_account: aws-load-balancer-controller-sa
+aws_load_balancer_controller_chart_version: "1.13.3"
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+# aws-lab root directory
+lab_root: "{{ playbook_dir }}/../.."
+
+# Terraform root directory
+terraform_root: "{{ lab_root }}/terraform"
+
+# ============================================================
+# TERRAFORM COMPONENTS
+# ============================================================
+
+terraform_components:
+  vpc: "{{ terraform_root }}/vpc"
+  eks: "{{ terraform_root }}/eks"
+  pod_identity: "{{ terraform_root }}/eks-addons/pod-identity-agent"
+  ebs: "{{ terraform_root }}/eks-addons/ebs-csi"
+  aws_load_balancer_controller: "{{ terraform_root }}/eks-addons/aws-load-balancer-controller"

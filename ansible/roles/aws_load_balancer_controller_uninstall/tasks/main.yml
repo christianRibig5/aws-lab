@@ -1,0 +1,29 @@
+---
+# ============================================================
+# AWS LOAD BALANCER CONTROLLER - UNINSTALL
+# ============================================================
+
+- name: Uninstall AWS Load Balancer Controller Helm release
+  ansible.builtin.command:
+    cmd: >-
+      helm uninstall aws-load-balancer-controller
+      -n {{ aws_load_balancer_controller_namespace }}
+  register: alb_uninstall
+  failed_when: false
+  changed_when: alb_uninstall.rc == 0
+
+- name: Verify AWS Load Balancer Controller deployment is removed
+  ansible.builtin.command:
+    cmd: >-
+      kubectl get deployment
+      aws-load-balancer-controller
+      -n {{ aws_load_balancer_controller_namespace }}
+  register: alb_deployment_check
+  failed_when: false
+  changed_when: false
+
+- name: Display AWS Load Balancer Controller removal status
+  ansible.builtin.debug:
+    msg: >-
+      AWS Load Balancer Controller Helm release removal completed.
+      Deployment check return code: {{ alb_deployment_check.rc }}

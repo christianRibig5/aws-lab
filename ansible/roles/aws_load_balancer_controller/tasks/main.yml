@@ -1,0 +1,79 @@
+---
+# ============================================================
+# AWS LOAD BALANCER CONTROLLER
+# ============================================================
+# Installs AWS Load Balancer Controller using Helm.
+# Terraform creates the IAM role, service account,
+# and EKS Pod Identity Association first.
+# ============================================================
+
+- name: Verify AWS Load Balancer Controller service account exists
+  ansible.builtin.command:
+    cmd: >-
+      kubectl get serviceaccount
+      {{ aws_load_balancer_controller_service_account }}
+      -n {{ aws_load_balancer_controller_namespace }}
+  changed_when: false
+
+- name: Get VPC ID from EKS cluster
+  ansible.builtin.command:
+    cmd: >-
+      aws eks describe-cluster
+      --name {{ eks_cluster_name }}
+      --region {{ aws_region }}
+      --profile {{ aws_profile }}
+      --query cluster.resourcesVpcConfig.vpcId
+      --output text
+  register: alb_vpc_id
+  changed_when: false
+
+- name: Add AWS EKS Helm repository
+  ansible.builtin.command:
+    cmd: >-
+      helm repo add eks
+      https://aws.github.io/eks-charts
+      --force-update
+  changed_when: false
+
+- name: Update AWS EKS Helm repository
+  ansible.builtin.command:
+    cmd: helm repo update eks
+  changed_when: false
+
+- name: Install or upgrade AWS Load Balancer Controller
+  ansible.builtin.command:
+    cmd: >-
+      helm upgrade --install aws-load-balancer-controller
+      eks/aws-load-balancer-controller
+      --namespace {{ aws_load_balancer_controller_namespace }}
+      --version {{ aws_load_balancer_controller_chart_version }}
+      --set clusterName={{ eks_cluster_name }}
+      --set region={{ aws_region }}
+      --set vpcId={{ alb_vpc_id.stdout }}
+      --set serviceAccount.create=false
+      --set serviceAccount.name={{ aws_load_balancer_controller_service_account }}
+      --wait
+      --timeout 5m
+  register: alb_controller_install
+
+- name: Verify AWS Load Balancer Controller rollout
+  ansible.builtin.command:
+    cmd: >-
+      kubectl rollout status
+      deployment/aws-load-balancer-controller
+      -n {{ aws_load_balancer_controller_namespace }}
+      --timeout=300s
+  changed_when: false
+
+- name: Verify AWS Load Balancer Controller pods
+  ansible.builtin.command:
+    cmd: >-
+      kubectl get pods
+      -n {{ aws_load_balancer_controller_namespace }}
+      -l app.kubernetes.io/name=aws-load-balancer-controller
+  register: alb_controller_pods
+  changed_when: false
+
+- name: Display AWS Load Balancer Controller pods
+  ansible.builtin.debug:
+    var: alb_controller_pods.stdout_lines

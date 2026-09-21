@@ -1,0 +1,37 @@
+---
+# ============================================================
+# SECRETS STORE CSI DRIVER - UNINSTALL
+# ============================================================
+
+- name: Uninstall Secrets Store CSI Driver Helm release
+  ansible.builtin.command:
+    cmd: >-
+      helm uninstall csi-secrets-store
+      -n kube-system
+  register: secrets_store_uninstall
+  failed_when: false
+  changed_when: secrets_store_uninstall.rc == 0
+
+- name: Verify Secrets Store CSI Driver pods are removed
+  ansible.builtin.command:
+    cmd: >-
+      kubectl get pods
+      -n kube-system
+      -l app=secrets-store-csi-driver
+  register: secrets_store_pods_check
+  failed_when: false
+  changed_when: false
+
+- name: Verify CSI driver object is removed
+  ansible.builtin.command:
+    cmd: kubectl get csidriver secrets-store.csi.k8s.io
+  register: secrets_store_driver_check
+  failed_when: false
+  changed_when: false
+
+- name: Display Secrets Store CSI Driver removal status
+  ansible.builtin.debug:
+    msg: >-
+      Secrets Store CSI Driver Helm release removal completed.
+      Pod check return code: {{ secrets_store_pods_check.rc }}.
+      CSI driver check return code: {{ secrets_store_driver_check.rc }}.

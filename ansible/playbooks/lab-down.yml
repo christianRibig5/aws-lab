@@ -1,0 +1,157 @@
+---
+# ============================================================
+# AWS LAB - LAB DOWN
+# ============================================================
+#
+# Destroys reusable AWS lab infrastructure
+# in reverse dependency order.
+#
+# Bootstrap is intentionally excluded because the Terraform
+# state bucket is persistent infrastructure.
+#
+# Destruction order:
+# AWS Load Balancer Controller Helm
+# -> AWS Load Balancer Controller Terraform
+# -> ASCP
+# -> Secrets Store CSI Driver
+# -> EBS CSI Driver
+# -> Pod Identity Agent
+# -> EKS
+# -> VPC
+#
+# ============================================================
+
+- name: AWS Lab - Destroy Terraform Infrastructure
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    # --------------------------------------------------------
+    # SAFETY GATE
+    # --------------------------------------------------------
+    - name: Confirm AWS lab destruction
+      ansible.builtin.pause:
+        prompt: |
+          WARNING: This will destroy the AWS lab infrastructure.
+
+          Destruction order:
+          AWS Load Balancer Controller Helm
+          -> AWS Load Balancer Controller Terraform
+          -> ASCP
+          -> Secrets Store CSI Driver
+          -> EBS CSI Driver
+          -> Pod Identity Agent
+          -> EKS
+          -> VPC
+
+          Bootstrap / Terraform state will remain.
+
+          Type DESTROY to continue
+      register: destroy_confirmation
+
+    - name: Stop unless destruction is confirmed
+      ansible.builtin.assert:
+        that:
+          - destroy_confirmation.user_input == "DESTROY"
+        fail_msg: "Lab destruction cancelled."
+        success_msg: "Destruction confirmed."
+
+    # --------------------------------------------------------
+    # Configure kubectl for the EKS cluster
+    # Required before removing Helm-managed components
+    # --------------------------------------------------------
+    - name: Configure kubectl for EKS
+      ansible.builtin.include_role:
+        name: eks_kubeconfig
+
+    # --------------------------------------------------------
+    # 1. AWS Load Balancer Controller - Helm
+    # --------------------------------------------------------
+    - name: Uninstall AWS Load Balancer Controller
+      ansible.builtin.include_role:
+        name: aws_load_balancer_controller_uninstall
+
+    # --------------------------------------------------------
+    # 2. AWS Load Balancer Controller - Terraform
+    # --------------------------------------------------------
+    - name: Terraform Destroy - AWS Load Balancer Controller
+      ansible.builtin.include_role:
+        name: terraform
+      vars:
+        terraform_working_dir: "{{ terraform_components.aws_load_balancer_controller }}"
+        terraform_action: "destroy"
+        terraform_auto_approve: true
+
+    # --------------------------------------------------------
+    # 3. AWS Secrets Config Provider (ASCP) - Helm
+    # --------------------------------------------------------
+    - name: Uninstall AWS Secrets Config Provider
+      ansible.builtin.include_role:
+        name: ascp_uninstall
+
+    # --------------------------------------------------------
+    # 4. Secrets Store CSI Driver - Helm
+    # --------------------------------------------------------
+    - name: Uninstall Secrets Store CSI Driver
+      ansible.builtin.include_role:
+        name: secrets_store_csi_uninstall
+
+    # --------------------------------------------------------
+    # 5. EBS CSI Driver
+    # --------------------------------------------------------
+    - name: Terraform Destroy - EBS CSI Driver
+      ansible.builtin.include_role:
+        name: terraform
+      vars:
+        terraform_working_dir: "{{ terraform_components.ebs }}"
+        terraform_action: "destroy"
+        terraform_auto_approve: true
+
+    # --------------------------------------------------------
+    # 6. EKS Pod Identity Agent
+    # --------------------------------------------------------
+    - name: Terraform Destroy - EKS Pod Identity Agent
+      ansible.builtin.include_role:
+        name: terraform
+      vars:
+        terraform_working_dir: "{{ terraform_components.pod_identity }}"
+        terraform_action: "destroy"
+        terraform_auto_approve: true
+
+    # --------------------------------------------------------
+    # 7. EKS Cluster
+    # --------------------------------------------------------
+    - name: Terraform Destroy - EKS
+      ansible.builtin.include_role:
+        name: terraform
+      vars:
+        terraform_working_dir: "{{ terraform_components.eks }}"
+        terraform_action: "destroy"
+        terraform_auto_approve: true
+
+    # --------------------------------------------------------
+    # 8. VPC
+    # --------------------------------------------------------
+    - name: Terraform Destroy - VPC
+      ansible.builtin.include_role:
+        name: terraform
+      vars:
+        terraform_working_dir: "{{ terraform_components.vpc }}"
+        terraform_action: "destroy"
+        terraform_auto_approve: true
+
+    # --------------------------------------------------------
+    # SUCCESS MESSAGE
+    # --------------------------------------------------------
+    - name: Confirm successful lab destruction
+      ansible.builtin.debug:
+        msg: |
+          ✅🟢 LAB DESTRUCTION COMPLETED SUCCESSFULLY
+
+          All Terraform-managed infrastructure has been destroyed.
+          Costly AWS lab resources are now shut down.
+          Bootstrap and Terraform state remain available for future lab deployments.

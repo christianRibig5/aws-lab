@@ -1,0 +1,117 @@
+---
+# ============================================================
+# TERRAFORM ROLE - MAIN TASKS
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Validate input
+# ------------------------------------------------------------
+
+- name: Validate Terraform working directory
+  ansible.builtin.assert:
+    that:
+      - terraform_working_dir | length > 0
+    fail_msg: "terraform_working_dir must be provided by the calling playbook."
+
+- name: Validate Terraform action
+  ansible.builtin.assert:
+    that:
+      - terraform_action in ["plan", "apply", "destroy"]
+    fail_msg: "terraform_action must be plan, apply, or destroy."
+
+# ------------------------------------------------------------
+# 2. Verify Terraform component directory exists
+# ------------------------------------------------------------
+
+- name: Check Terraform component directory
+  ansible.builtin.stat:
+    path: "{{ terraform_working_dir }}"
+  register: terraform_directory
+
+- name: Ensure Terraform component directory exists
+  ansible.builtin.assert:
+    that:
+      - terraform_directory.stat.exists
+      - terraform_directory.stat.isdir
+    fail_msg: "Terraform directory does not exist: {{ terraform_working_dir }}"
+
+# ------------------------------------------------------------
+# 3. Terraform init
+# ------------------------------------------------------------
+
+- name: Initialize Terraform
+  ansible.builtin.command:
+    cmd: terraform init -input=false
+    chdir: "{{ terraform_working_dir }}"
+  environment:
+    AWS_PROFILE: "{{ aws_profile }}"
+    AWS_REGION: "{{ aws_region }}"
+  when: terraform_run_init
+  changed_when: false
+
+# ------------------------------------------------------------
+# 4. Terraform validate
+# ------------------------------------------------------------
+
+- name: Validate Terraform configuration
+  ansible.builtin.command:
+    cmd: terraform validate
+    chdir: "{{ terraform_working_dir }}"
+  environment:
+    AWS_PROFILE: "{{ aws_profile }}"
+    AWS_REGION: "{{ aws_region }}"
+  changed_when: false
+
+# ------------------------------------------------------------
+# 5. Terraform plan
+# ------------------------------------------------------------
+
+- name: Run Terraform plan
+  ansible.builtin.command:
+    cmd: terraform plan -input=false -no-color
+    chdir: "{{ terraform_working_dir }}"
+  environment:
+    AWS_PROFILE: "{{ aws_profile }}"
+    AWS_REGION: "{{ aws_region }}"
+  register: terraform_plan
+  changed_when: false
+  when: terraform_action == "plan"
+
+- name: Display Terraform plan
+  ansible.builtin.debug:
+    var: terraform_plan.stdout_lines
+  when:
+    - terraform_action == "plan"
+    - terraform_plan is defined
+
+# ------------------------------------------------------------
+# 6. Terraform apply
+# ------------------------------------------------------------
+
+- name: Run Terraform apply
+  ansible.builtin.command:
+    cmd: >-
+      terraform apply
+      -input=false
+      {{ '-auto-approve' if terraform_auto_approve else '' }}
+    chdir: "{{ terraform_working_dir }}"
+  environment:
+    AWS_PROFILE: "{{ aws_profile }}"
+    AWS_REGION: "{{ aws_region }}"
+  when: terraform_action == "apply"
+
+# ------------------------------------------------------------
+# 7. Terraform destroy
+# ------------------------------------------------------------
+
+- name: Run Terraform destroy
+  ansible.builtin.command:
+    cmd: >-
+      terraform destroy
+      -input=false
+      {{ '-auto-approve' if terraform_auto_approve else '' }}
+    chdir: "{{ terraform_working_dir }}"
+  environment:
+    AWS_PROFILE: "{{ aws_profile }}"
+    AWS_REGION: "{{ aws_region }}"
+  when: terraform_action == "destroy"
