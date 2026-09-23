@@ -1,0 +1,25 @@
+---
+- name: Verify cleanup script exists
+  ansible.builtin.stat:
+    path: "{{ cleanup_check_script }}"
+  register: cleanup_script
+
+- name: Stop when cleanup script is missing
+  ansible.builtin.assert:
+    that:
+      - cleanup_script.stat.exists
+      - cleanup_script.stat.isreg
+    fail_msg: "Cleanup verification script not found: {{ cleanup_check_script }}"
+
+- name: Verify that the AWS lab is completely clean
+  ansible.builtin.command:
+    argv:
+      - bash
+      - "{{ cleanup_check_script }}"
+  register: cleanup_check
+  changed_when: false
+  failed_when: cleanup_check.rc != 0
+
+- name: Display cleanup verification result
+  ansible.builtin.debug:
+    var: cleanup_check.stdout_lines

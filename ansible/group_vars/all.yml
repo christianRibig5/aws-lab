@@ -31,3 +31,7 @@ terraform_components:
   pod_identity: "{{ terraform_root }}/eks-addons/pod-identity-agent"
   ebs: "{{ terraform_root }}/eks-addons/ebs-csi"
   aws_load_balancer_controller: "{{ terraform_root }}/eks-addons/aws-load-balancer-controller"
+
+# Scrips
+scripts_root: "{{ lab_root }}/scripts"
+cleanup_check_script: "{{ scripts_root }}/check-lab-clean.sh"

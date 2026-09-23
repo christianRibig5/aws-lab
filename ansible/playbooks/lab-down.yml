@@ -29,6 +29,42 @@
   vars_files:
     - ../group_vars/all.yml
 
+  pre_tasks:
+    - name: Check whether the EKS cluster exists
+      ansible.builtin.command:
+        argv:
+          - aws
+          - eks
+          - describe-cluster
+          - --region
+          - "{{ aws_region }}"
+          - --name
+          - "{{ eks_cluster_name }}"
+          - --profile
+          - "{{ aws_profile }}"
+          - --query
+          - cluster.status
+          - --output
+          - text
+      register: eks_cluster_check
+      changed_when: false
+      failed_when:
+        - eks_cluster_check.rc != 0
+        - "'ResourceNotFoundException' not in eks_cluster_check.stderr"
+
+    - name: Record EKS cluster availability
+      ansible.builtin.set_fact:
+        eks_cluster_exists: "{{ eks_cluster_check.rc == 0 }}"
+
+    - name: Display EKS status
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'EKS cluster exists. Kubernetes cleanup will run.'
+            if eks_cluster_exists
+            else 'EKS cluster does not exist. Kubernetes cleanup will be skipped.'
+          }}
+
   tasks:
     # --------------------------------------------------------
     # SAFETY GATE
@@ -67,6 +103,7 @@
     - name: Configure kubectl for EKS
       ansible.builtin.include_role:
         name: eks_kubeconfig
+      when: eks_cluster_exists | bool
 
     # --------------------------------------------------------
     # 1. AWS Load Balancer Controller - Helm
@@ -74,6 +111,7 @@
     - name: Uninstall AWS Load Balancer Controller
       ansible.builtin.include_role:
         name: aws_load_balancer_controller_uninstall
+      when: eks_cluster_exists | bool
 
     # --------------------------------------------------------
     # 2. AWS Load Balancer Controller - Terraform
@@ -92,6 +130,7 @@
     - name: Uninstall AWS Secrets Config Provider
       ansible.builtin.include_role:
         name: ascp_uninstall
+      when: eks_cluster_exists | bool
 
     # --------------------------------------------------------
     # 4. Secrets Store CSI Driver - Helm
@@ -99,6 +138,7 @@
     - name: Uninstall Secrets Store CSI Driver
       ansible.builtin.include_role:
         name: secrets_store_csi_uninstall
+      when: eks_cluster_exists | bool
 
     # --------------------------------------------------------
     # 5. EBS CSI Driver
@@ -155,3 +195,17 @@
           All Terraform-managed infrastructure has been destroyed.
           Costly AWS lab resources are now shut down.
           Bootstrap and Terraform state remain available for future lab deployments.
+
+  post_tasks:
+    - name: Verify that the AWS lab is completely clean
+      ansible.builtin.command:
+        argv:
+          - bash
+          - "{{ cleanup_check_script }}"
+      register: cleanup_check
+      changed_when: false
+      failed_when: cleanup_check.rc != 0
+
+    - name: Display cleanup verification result
+      ansible.builtin.debug:
+        var: cleanup_check.stdout_lines
