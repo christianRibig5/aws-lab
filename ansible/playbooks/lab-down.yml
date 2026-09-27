@@ -1,27 +1,43 @@
 ---
 # ============================================================
-# AWS LAB - LAB DOWN
+# AWS LAB - COMPLETE / IDEMPOTENT LAB DESTRUCTION
 # ============================================================
 #
-# Destroys reusable AWS lab infrastructure
-# in reverse dependency order.
+# PURPOSE:
+# Completely destroy disposable AWS lab infrastructure while
+# preserving only persistent bootstrap / Terraform state.
 #
-# Bootstrap is intentionally excluded because the Terraform
-# state bucket is persistent infrastructure.
+# DESIGN GOALS:
 #
-# Destruction order:
-# AWS Load Balancer Controller Helm
-# -> AWS Load Balancer Controller Terraform
-# -> ASCP
-# -> Secrets Store CSI Driver
-# -> EBS CSI Driver
-# -> Pod Identity Agent
-# -> EKS
-# -> VPC
+# 1. Safe to run when the lab is fully running.
+# 2. Safe to run when the lab is partially destroyed.
+# 3. Safe to run when the lab is already destroyed.
+# 4. Clean Kubernetes Ingress / ALB resources before removing
+#    the AWS Load Balancer Controller.
+# 5. Wait for AWS-managed resources to disappear.
+# 6. Prevent long Terraform VPC DependencyViolation waits.
+# 7. Preserve bootstrap / Terraform remote state.
+#
+# PRESERVED:
+# - Bootstrap infrastructure
+# - Terraform remote-state S3 bucket/state
+#
+# DESTROYED:
+# - Kubernetes Ingress resources
+# - Lab ALBs / NLBs
+# - AWS Load Balancer Controller
+# - ASCP
+# - Secrets Store CSI Driver
+# - EBS CSI resources
+# - Pod Identity resources
+# - EKS
+# - Orphaned Kubernetes LB security groups
+# - VPC networking
+# - VPC
 #
 # ============================================================
 
-- name: AWS Lab - Destroy Terraform Infrastructure
+- name: AWS Lab - Complete Destruction
   hosts: localhost
   connection: local
   gather_facts: false
@@ -29,7 +45,13 @@
   vars_files:
     - ../group_vars/all.yml
 
+  # ==========================================================
+  # PRE-TASKS
+  # ==========================================================
   pre_tasks:
+    # --------------------------------------------------------
+    # 1. CHECK EKS
+    # --------------------------------------------------------
     - name: Check whether the EKS cluster exists
       ansible.builtin.command:
         argv:
@@ -52,39 +74,169 @@
         - eks_cluster_check.rc != 0
         - "'ResourceNotFoundException' not in eks_cluster_check.stderr"
 
-    - name: Record EKS cluster availability
+    - name: Record EKS availability
       ansible.builtin.set_fact:
         eks_cluster_exists: "{{ eks_cluster_check.rc == 0 }}"
 
-    - name: Display EKS status
-      ansible.builtin.debug:
-        msg: >-
+    # --------------------------------------------------------
+    # 2. READ VPC ID FROM TERRAFORM STATE
+    #
+    # This retrieves the VPC ID known to Terraform.
+    # It does NOT by itself prove that the VPC still exists.
+    # --------------------------------------------------------
+    - name: Read lab VPC ID from Terraform state
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - "-chdir={{ terraform_components.vpc }}"
+          - output
+          - -raw
+          - vpc_id
+      register: vpc_output
+      changed_when: false
+      failed_when: false
+
+    - name: Record Terraform VPC information
+      ansible.builtin.set_fact:
+        lab_vpc_id: "{{ vpc_output.stdout | default('') | trim }}"
+        terraform_has_vpc_id: >-
           {{
-            'EKS cluster exists. Kubernetes cleanup will run.'
-            if eks_cluster_exists
-            else 'EKS cluster does not exist. Kubernetes cleanup will be skipped.'
+            vpc_output.rc == 0
+            and
+            (vpc_output.stdout | default('') | trim | length > 0)
           }}
 
+    # --------------------------------------------------------
+    # 3. VERIFY VPC AGAINST AWS
+    #
+    # Terraform state may still contain a VPC ID even when
+    # the actual VPC has already been deleted.
+    # --------------------------------------------------------
+    - name: Verify Terraform VPC ID exists in AWS
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - describe-vpcs
+          - --vpc-ids
+          - "{{ lab_vpc_id }}"
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --query
+          - Vpcs[0].VpcId
+          - --output
+          - text
+      register: aws_vpc_check
+      changed_when: false
+      failed_when: false
+      when: terraform_has_vpc_id | bool
+
+    - name: Record actual AWS VPC availability
+      ansible.builtin.set_fact:
+        lab_vpc_exists: >-
+          {{
+            terraform_has_vpc_id | bool
+            and
+            not (aws_vpc_check.skipped | default(false))
+            and
+            (aws_vpc_check.rc | default(1)) == 0
+            and
+            (aws_vpc_check.stdout | default('') | trim) == lab_vpc_id
+          }}
+
+    # --------------------------------------------------------
+    # 4. DISPLAY CURRENT STATE
+    # --------------------------------------------------------
+    - name: Display infrastructure status
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          AWS LAB CURRENT STATE
+          ============================================================
+
+          EKS exists:            {{ eks_cluster_exists }}
+          Terraform has VPC ID: {{ terraform_has_vpc_id }}
+          VPC ID:               {{ lab_vpc_id | default('N/A', true) }}
+          VPC actually exists:  {{ lab_vpc_exists }}
+
+          ============================================================
+
+    # ========================================================
+    # IDEMPOTENCY GATE
+    #
+    # If EKS and VPC are already absent, the desired state
+    # has already been reached.
+    #
+    # End BEFORE:
+    # - asking for DESTROY
+    # - configuring kubectl
+    # - Terraform init
+    # - Terraform destroy
+    # ========================================================
+
+    - name: Report lab is already completely down
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          ✅🟢 AWS LAB IS ALREADY DOWN
+          ============================================================
+
+          EKS cluster: NOT FOUND
+          Lab VPC:     NOT FOUND
+
+          No lab destruction is required.
+          No Terraform destroy operations will be executed.
+
+          Preserved intentionally:
+          - Bootstrap infrastructure
+          - Terraform remote state
+
+          ============================================================
+      when:
+        - not (eks_cluster_exists | bool)
+        - not (lab_vpc_exists | bool)
+
+    - name: End play when lab is already down
+      ansible.builtin.meta: end_play
+      when:
+        - not (eks_cluster_exists | bool)
+        - not (lab_vpc_exists | bool)
+
+  # ==========================================================
+  # MAIN DESTRUCTION
+  # ==========================================================
   tasks:
-    # --------------------------------------------------------
-    # SAFETY GATE
-    # --------------------------------------------------------
-    - name: Confirm AWS lab destruction
+    # ========================================================
+    # SAFETY CONFIRMATION
+    # ========================================================
+    - name: Confirm COMPLETE AWS lab destruction
       ansible.builtin.pause:
         prompt: |
-          WARNING: This will destroy the AWS lab infrastructure.
+          ============================================================
+          WARNING - COMPLETE LAB DESTRUCTION
+          ============================================================
 
-          Destruction order:
-          AWS Load Balancer Controller Helm
-          -> AWS Load Balancer Controller Terraform
-          -> ASCP
-          -> Secrets Store CSI Driver
-          -> EBS CSI Driver
-          -> Pod Identity Agent
-          -> EKS
-          -> VPC
+          This will destroy disposable AWS lab infrastructure.
 
-          Bootstrap / Terraform state will remain.
+          This includes:
+
+          - Kubernetes Ingress resources
+          - Lab ALBs / NLBs
+          - AWS Load Balancer Controller
+          - CSI components
+          - EBS CSI infrastructure
+          - Pod Identity infrastructure
+          - EKS
+          - Kubernetes load-balancer security groups
+          - VPC networking
+          - VPC
+
+          PRESERVED:
+
+          - Bootstrap infrastructure
+          - Terraform remote state
 
           Type DESTROY to continue
       register: destroy_confirmation
@@ -94,28 +246,153 @@
         that:
           - destroy_confirmation.user_input == "DESTROY"
         fail_msg: "Lab destruction cancelled."
-        success_msg: "Destruction confirmed."
+        success_msg: "Complete lab destruction confirmed."
 
-    # --------------------------------------------------------
-    # Configure kubectl for the EKS cluster
-    # Required before removing Helm-managed components
-    # --------------------------------------------------------
+    # ========================================================
+    # KUBERNETES CLEANUP
+    # ========================================================
+
     - name: Configure kubectl for EKS
       ansible.builtin.include_role:
         name: eks_kubeconfig
       when: eks_cluster_exists | bool
 
     # --------------------------------------------------------
-    # 1. AWS Load Balancer Controller - Helm
+    # Delete Ingress BEFORE removing ALB Controller.
+    #
+    # This allows the controller to clean up ALBs/NLBs,
+    # associated ENIs and managed security groups.
     # --------------------------------------------------------
+    - name: Delete all Kubernetes Ingress resources
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - delete
+          - ingress
+          - --all
+          - --all-namespaces
+          - --ignore-not-found=true
+          - --wait=true
+      register: ingress_cleanup
+      changed_when: "'deleted' in ingress_cleanup.stdout"
+      when: eks_cluster_exists | bool
+
+    # ========================================================
+    # LOAD BALANCER CLEANUP
+    # ========================================================
+
+    # --------------------------------------------------------
+    # Give AWS Load Balancer Controller time to perform
+    # graceful cleanup first.
+    # --------------------------------------------------------
+    - name: Wait for Kubernetes controller to delete lab load balancers
+      ansible.builtin.command:
+        argv:
+          - aws
+          - elbv2
+          - describe-load-balancers
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --query
+          - "LoadBalancers[?VpcId=='{{ lab_vpc_id }}'].LoadBalancerArn"
+          - --output
+          - json
+      register: controller_lb_cleanup
+      changed_when: false
+      failed_when: false
+      retries: 30
+      delay: 10
+      until: >
+        (controller_lb_cleanup.stdout | default('[]') | from_json | length) == 0
+      when:
+        - eks_cluster_exists | bool
+        - lab_vpc_exists | bool
+
+    # --------------------------------------------------------
+    # Find any remaining ALBs/NLBs after graceful cleanup.
+    # --------------------------------------------------------
+    - name: Find remaining lab load balancers
+      ansible.builtin.command:
+        argv:
+          - aws
+          - elbv2
+          - describe-load-balancers
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --query
+          - "LoadBalancers[?VpcId=='{{ lab_vpc_id }}'].LoadBalancerArn"
+          - --output
+          - json
+      register: remaining_lbs
+      changed_when: false
+      when: lab_vpc_exists | bool
+
+    - name: Record remaining lab load balancers
+      ansible.builtin.set_fact:
+        remaining_lb_arns: >-
+          {{
+            remaining_lbs.stdout | default('[]') | from_json
+          }}
+      when: lab_vpc_exists | bool
+
+    # --------------------------------------------------------
+    # Fallback cleanup for orphaned LBs scoped to lab VPC.
+    # --------------------------------------------------------
+    - name: Delete orphaned lab load balancers
+      ansible.builtin.command:
+        argv:
+          - aws
+          - elbv2
+          - delete-load-balancer
+          - --load-balancer-arn
+          - "{{ item }}"
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+      loop: "{{ remaining_lb_arns | default([]) }}"
+      when:
+        - lab_vpc_exists | bool
+        - remaining_lb_arns | default([]) | length > 0
+
+    # --------------------------------------------------------
+    # Wait until AWS confirms the LBs are really gone.
+    # --------------------------------------------------------
+    - name: Wait until all lab load balancers are gone
+      ansible.builtin.command:
+        argv:
+          - aws
+          - elbv2
+          - describe-load-balancers
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --query
+          - "LoadBalancers[?VpcId=='{{ lab_vpc_id }}'].LoadBalancerArn"
+          - --output
+          - json
+      register: lb_final_check
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: >
+        (lb_final_check.stdout | default('[]') | from_json | length) == 0
+      when: lab_vpc_exists | bool
+
+    # ========================================================
+    # AWS LOAD BALANCER CONTROLLER
+    # ========================================================
+
     - name: Uninstall AWS Load Balancer Controller
       ansible.builtin.include_role:
         name: aws_load_balancer_controller_uninstall
       when: eks_cluster_exists | bool
 
-    # --------------------------------------------------------
-    # 2. AWS Load Balancer Controller - Terraform
-    # --------------------------------------------------------
     - name: Terraform Destroy - AWS Load Balancer Controller
       ansible.builtin.include_role:
         name: terraform
@@ -123,26 +400,26 @@
         terraform_working_dir: "{{ terraform_components.aws_load_balancer_controller }}"
         terraform_action: "destroy"
         terraform_auto_approve: true
+      when: eks_cluster_exists | bool
 
-    # --------------------------------------------------------
-    # 3. AWS Secrets Config Provider (ASCP) - Helm
-    # --------------------------------------------------------
+    # ========================================================
+    # SECRETS COMPONENTS
+    # ========================================================
+
     - name: Uninstall AWS Secrets Config Provider
       ansible.builtin.include_role:
         name: ascp_uninstall
       when: eks_cluster_exists | bool
 
-    # --------------------------------------------------------
-    # 4. Secrets Store CSI Driver - Helm
-    # --------------------------------------------------------
     - name: Uninstall Secrets Store CSI Driver
       ansible.builtin.include_role:
         name: secrets_store_csi_uninstall
       when: eks_cluster_exists | bool
 
-    # --------------------------------------------------------
-    # 5. EBS CSI Driver
-    # --------------------------------------------------------
+    # ========================================================
+    # EBS CSI
+    # ========================================================
+
     - name: Terraform Destroy - EBS CSI Driver
       ansible.builtin.include_role:
         name: terraform
@@ -150,10 +427,12 @@
         terraform_working_dir: "{{ terraform_components.ebs }}"
         terraform_action: "destroy"
         terraform_auto_approve: true
+      when: eks_cluster_exists | bool
 
-    # --------------------------------------------------------
-    # 6. EKS Pod Identity Agent
-    # --------------------------------------------------------
+    # ========================================================
+    # POD IDENTITY AGENT
+    # ========================================================
+
     - name: Terraform Destroy - EKS Pod Identity Agent
       ansible.builtin.include_role:
         name: terraform
@@ -161,10 +440,12 @@
         terraform_working_dir: "{{ terraform_components.pod_identity }}"
         terraform_action: "destroy"
         terraform_auto_approve: true
+      when: eks_cluster_exists | bool
 
-    # --------------------------------------------------------
-    # 7. EKS Cluster
-    # --------------------------------------------------------
+    # ========================================================
+    # EKS
+    # ========================================================
+
     - name: Terraform Destroy - EKS
       ansible.builtin.include_role:
         name: terraform
@@ -172,10 +453,319 @@
         terraform_working_dir: "{{ terraform_components.eks }}"
         terraform_action: "destroy"
         terraform_auto_approve: true
+      when: eks_cluster_exists | bool
+
+    # ========================================================
+    # WAIT FOR AWS-MANAGED NETWORK CLEANUP
+    # ========================================================
+
+    - name: Wait for AWS-managed ENIs to disappear
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - describe-network-interfaces
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --filters
+          - "Name=vpc-id,Values={{ lab_vpc_id }}"
+          - --query
+          - NetworkInterfaces[].NetworkInterfaceId
+          - --output
+          - json
+      register: eni_wait
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: >
+        (eni_wait.stdout | default('[]') | from_json | length) == 0
+      when: lab_vpc_exists | bool
+
+    # ========================================================
+    # ORPHANED KUBERNETES SECURITY GROUP CLEANUP
+    # ========================================================
+
+    - name: Find orphaned Kubernetes load balancer security groups
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - describe-security-groups
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --filters
+          - "Name=vpc-id,Values={{ lab_vpc_id }}"
+          - --query
+          - "SecurityGroups[?GroupName!='default' && contains(Description, '[k8s]')].GroupId"
+          - --output
+          - json
+      register: k8s_security_groups
+      changed_when: false
+      when: lab_vpc_exists | bool
+
+    - name: Record orphaned Kubernetes security groups
+      ansible.builtin.set_fact:
+        k8s_security_group_ids: >-
+          {{
+            k8s_security_groups.stdout | default('[]') | from_json
+          }}
+      when: lab_vpc_exists | bool
+
+    - name: Delete orphaned Kubernetes load balancer security groups
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - delete-security-group
+          - --group-id
+          - "{{ item }}"
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+      loop: "{{ k8s_security_group_ids | default([]) }}"
+      when:
+        - lab_vpc_exists | bool
+        - k8s_security_group_ids | default([]) | length > 0
+
+    # ========================================================
+    # FINAL VPC DEPENDENCY CHECK
+    # ========================================================
 
     # --------------------------------------------------------
-    # 8. VPC
+    # ENIs
     # --------------------------------------------------------
+    - name: Check final ENIs
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - describe-network-interfaces
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --filters
+          - "Name=vpc-id,Values={{ lab_vpc_id }}"
+          - --query
+          - "NetworkInterfaces[].{ID:NetworkInterfaceId,Description:Description}"
+          - --output
+          - json
+      register: final_enis
+      changed_when: false
+      when: lab_vpc_exists | bool
+
+    # --------------------------------------------------------
+    # NON-DEFAULT SECURITY GROUPS
+    # --------------------------------------------------------
+    - name: Check final non-default security groups
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - describe-security-groups
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --filters
+          - "Name=vpc-id,Values={{ lab_vpc_id }}"
+          - --query
+          - "SecurityGroups[?GroupName!='default'].{ID:GroupId,Name:GroupName,Description:Description}"
+          - --output
+          - json
+      register: final_security_groups
+      changed_when: false
+      when: lab_vpc_exists | bool
+
+    # --------------------------------------------------------
+    # NAT GATEWAYS
+    # --------------------------------------------------------
+    - name: Check final NAT gateways
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - describe-nat-gateways
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --filter
+          - "Name=vpc-id,Values={{ lab_vpc_id }}"
+          - --query
+          - "NatGateways[?State!='deleted'].{ID:NatGatewayId,State:State}"
+          - --output
+          - json
+      register: final_nat_gateways
+      changed_when: false
+      when: lab_vpc_exists | bool
+
+    # --------------------------------------------------------
+    # VPC ENDPOINTS
+    # --------------------------------------------------------
+    - name: Check final VPC endpoints
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - describe-vpc-endpoints
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --filters
+          - "Name=vpc-id,Values={{ lab_vpc_id }}"
+          - --query
+          - "VpcEndpoints[].{ID:VpcEndpointId,Service:ServiceName,State:State}"
+          - --output
+          - json
+      register: final_vpc_endpoints
+      changed_when: false
+      when: lab_vpc_exists | bool
+
+    # --------------------------------------------------------
+    # ROUTE TABLES
+    #
+    # Ignore the main route table because AWS removes it with
+    # the VPC.
+    #
+    # IMPORTANT:
+    # YAML single quotes are used here intentionally.
+    # Do NOT escape the JMESPath backticks.
+    # --------------------------------------------------------
+    - name: Check final non-main route tables
+      ansible.builtin.command:
+        argv:
+          - aws
+          - ec2
+          - describe-route-tables
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --filters
+          - "Name=vpc-id,Values={{ lab_vpc_id }}"
+          - --query
+          - "RouteTables[?length(Associations[?Main==`true`]) == `0`].RouteTableId"
+          - --output
+          - json
+      register: final_route_tables
+      changed_when: false
+      when: lab_vpc_exists | bool
+
+    # --------------------------------------------------------
+    # RECORD FINAL DEPENDENCIES
+    # --------------------------------------------------------
+    - name: Record final VPC dependency results
+      ansible.builtin.set_fact:
+        final_eni_list: >-
+          {{
+            final_enis.stdout | default('[]') | from_json
+          }}
+
+        final_sg_list: >-
+          {{
+            final_security_groups.stdout | default('[]') | from_json
+          }}
+
+        final_nat_list: >-
+          {{
+            final_nat_gateways.stdout | default('[]') | from_json
+          }}
+
+        final_endpoint_list: >-
+          {{
+            final_vpc_endpoints.stdout | default('[]') | from_json
+          }}
+
+        final_route_table_list: >-
+          {{
+            final_route_tables.stdout | default('[]') | from_json
+          }}
+      when: lab_vpc_exists | bool
+
+    # --------------------------------------------------------
+    # FAIL FAST INSTEAD OF WAITING FOR TERRAFORM TIMEOUT
+    # --------------------------------------------------------
+    - name: Stop if unexpected VPC dependencies remain
+      ansible.builtin.fail:
+        msg: |
+          ============================================================
+          ❌ VPC DESTRUCTION BLOCKED
+          ============================================================
+
+          Unexpected AWS resources still depend on:
+
+          {{ lab_vpc_id }}
+
+          ------------------------------------------------------------
+          ENIs
+          ------------------------------------------------------------
+          {{ final_eni_list | to_nice_json }}
+
+          ------------------------------------------------------------
+          Non-default Security Groups
+          ------------------------------------------------------------
+          {{ final_sg_list | to_nice_json }}
+
+          ------------------------------------------------------------
+          NAT Gateways
+          ------------------------------------------------------------
+          {{ final_nat_list | to_nice_json }}
+
+          ------------------------------------------------------------
+          VPC Endpoints
+          ------------------------------------------------------------
+          {{ final_endpoint_list | to_nice_json }}
+
+          ------------------------------------------------------------
+          Non-main Route Tables
+          ------------------------------------------------------------
+          {{ final_route_table_list | to_nice_json }}
+
+          Terraform VPC destruction has NOT been started.
+
+          This prevents Terraform from waiting for AWS and eventually
+          failing with DependencyViolation.
+
+          ============================================================
+      when:
+        - lab_vpc_exists | bool
+        - >
+          (final_eni_list | length > 0) or
+          (final_sg_list | length > 0) or
+          (final_nat_list | length > 0) or
+          (final_endpoint_list | length > 0) or
+          (final_route_table_list | length > 0)
+
+    - name: Confirm VPC dependency validation passed
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          ✅ VPC DEPENDENCY VALIDATION PASSED
+          ============================================================
+
+          No blocking:
+          - ENIs
+          - Non-default security groups
+          - NAT gateways
+          - VPC endpoints
+          - Non-main route tables
+
+          Terraform VPC destruction may proceed.
+
+          ============================================================
+      when: lab_vpc_exists | bool
+
+    # ========================================================
+    # VPC
+    # ========================================================
+
     - name: Terraform Destroy - VPC
       ansible.builtin.include_role:
         name: terraform
@@ -183,19 +773,40 @@
         terraform_working_dir: "{{ terraform_components.vpc }}"
         terraform_action: "destroy"
         terraform_auto_approve: true
+      when: lab_vpc_exists | bool
 
-    # --------------------------------------------------------
-    # SUCCESS MESSAGE
-    # --------------------------------------------------------
-    - name: Confirm successful lab destruction
+    # ========================================================
+    # SUCCESS
+    # ========================================================
+
+    - name: Confirm successful complete lab destruction
       ansible.builtin.debug:
         msg: |
-          ✅🟢 LAB DESTRUCTION COMPLETED SUCCESSFULLY
+          ============================================================
+          ✅🟢 AWS LAB DESTRUCTION COMPLETED SUCCESSFULLY
+          ============================================================
 
-          All Terraform-managed infrastructure has been destroyed.
-          Costly AWS lab resources are now shut down.
-          Bootstrap and Terraform state remain available for future lab deployments.
+          Disposable lab infrastructure has been shut down.
 
+          Destroyed:
+          - Kubernetes Ingress / load-balancer resources
+          - AWS Load Balancer Controller
+          - CSI components
+          - EBS CSI infrastructure
+          - Pod Identity infrastructure
+          - EKS
+          - Lab VPC networking
+          - VPC
+
+          Preserved intentionally:
+          - Bootstrap infrastructure
+          - Terraform remote state
+
+          ============================================================
+
+  # ==========================================================
+  # POST-TASKS
+  # ==========================================================
   post_tasks:
     - name: Verify that the AWS lab is completely clean
       ansible.builtin.command:
