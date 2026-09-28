@@ -3,22 +3,61 @@
 # AWS LAB - LAB UP
 # ============================================================
 #
-# Orchestrates reusable AWS lab infrastructure
-# in dependency order.
+# Purpose:
+# Bring the reusable AWS lab infrastructure online in
+# dependency order.
 #
-# Default action: plan
-# Apply must be explicitly requested.
+# This playbook is the LAB ON switch.
+#
+# Usage:
+#
+#   ansible-playbook playbooks/lab-up.yml
+#
+# Behaviour:
+#
+#   1. Validate AWS authentication.
+#   2. Offer AWS SSO login if authentication has expired.
+#   3. Check whether the EKS cluster already exists.
+#   4. If EKS is ACTIVE:
+#        - report that the lab is already up
+#        - make no infrastructure changes
+#        - exit successfully
+#   5. If EKS does not exist:
+#        - request LAB-UP confirmation
+#        - apply infrastructure in dependency order
+#   6. If EKS exists but is not ACTIVE:
+#        - stop safely
 #
 # Bootstrap is intentionally excluded because the Terraform
 # state bucket is persistent infrastructure.
 #
-# Authentication:
-#   AWS credentials / SSO are validated before Terraform runs.
-#   If the SSO session has expired, Ansible can launch
-#   `aws sso login` and then continue after authentication.
+# Deployment order:
+#
+#   AWS Authentication
+#        ->
+#   Lab State Check
+#        ->
+#   VPC
+#        ->
+#   EKS
+#        ->
+#   kubectl configuration
+#        ->
+#   EKS Pod Identity Agent
+#        ->
+#   EBS CSI Driver
+#        ->
+#   Secrets Store CSI Driver
+#        ->
+#   AWS Secrets Config Provider (ASCP)
+#        ->
+#   AWS Load Balancer Controller IAM / Pod Identity
+#        ->
+#   AWS Load Balancer Controller Helm
+#
 # ============================================================
 
-- name: AWS Lab - Terraform Infrastructure
+- name: AWS Lab - Bring Up
   hosts: localhost
   connection: local
   gather_facts: false
@@ -28,13 +67,10 @@
 
   tasks:
     # ========================================================
-    # 0. AWS AUTHENTICATION PREFLIGHT
+    # 0A. AWS AUTHENTICATION
     #
-    # Terraform requires valid AWS credentials even during
-    # `terraform init` because the remote state backend is S3.
-    #
-    # Check authentication before any Terraform component is
-    # initialized.
+    # Terraform requires valid AWS credentials before
+    # terraform init can access the S3 remote backend.
     # ========================================================
 
     - name: Check AWS authentication
@@ -54,7 +90,7 @@
       failed_when: false
 
     # --------------------------------------------------------
-    # AWS session is already valid
+    # Existing AWS session is valid
     # --------------------------------------------------------
 
     - name: Report active AWS session
@@ -71,7 +107,7 @@
       when: aws_auth_check.rc == 0
 
     # --------------------------------------------------------
-    # AWS session is expired / unavailable
+    # Existing AWS session is invalid / expired
     # --------------------------------------------------------
 
     - name: Report expired AWS session
@@ -89,12 +125,16 @@
       when: aws_auth_check.rc != 0
 
     # --------------------------------------------------------
-    # Ask whether Ansible should launch AWS SSO login.
+    # Ask permission before launching AWS SSO.
     # --------------------------------------------------------
 
     - name: Ask to authenticate with AWS SSO
       ansible.builtin.pause:
         prompt: |
+
+          ============================================================
+          AWS SSO LOGIN REQUIRED
+          ============================================================
 
           AWS authentication is not currently valid.
 
@@ -106,11 +146,12 @@
 
           Type LOGIN to authenticate now.
           Press Enter to cancel lab-up.
+
       register: aws_sso_confirmation
       when: aws_auth_check.rc != 0
 
     # --------------------------------------------------------
-    # Stop safely if login was not approved.
+    # Cancel safely when SSO login is not approved.
     # --------------------------------------------------------
 
     - name: Stop when AWS SSO login is declined
@@ -123,7 +164,7 @@
 
           AWS authentication is required.
 
-          You can authenticate manually with:
+          Authenticate manually with:
 
             aws sso login --profile {{ aws_profile }}
 
@@ -133,14 +174,13 @@
 
           No lab infrastructure changes were made.
           ============================================================
+
       when:
         - aws_auth_check.rc != 0
         - aws_sso_confirmation.user_input | default('') != "LOGIN"
 
     # --------------------------------------------------------
-    # Launch AWS SSO login.
-    #
-    # AWS CLI controls the browser/device authorization flow.
+    # Perform AWS SSO authentication.
     # --------------------------------------------------------
 
     - name: Login to AWS SSO
@@ -158,7 +198,7 @@
         - aws_sso_confirmation.user_input | default('') == "LOGIN"
 
     # --------------------------------------------------------
-    # Verify credentials again after login.
+    # Verify authentication again after SSO login.
     # --------------------------------------------------------
 
     - name: Verify AWS authentication after SSO login
@@ -179,8 +219,8 @@
       when: aws_auth_check.rc != 0
 
     # --------------------------------------------------------
-    # Do not allow Terraform to continue unless authentication
-    # has now been verified.
+    # Terraform must never start unless AWS authentication
+    # has been successfully verified.
     # --------------------------------------------------------
 
     - name: Validate AWS authentication
@@ -201,7 +241,7 @@
 
           AWS authentication could not be verified.
 
-          Run manually:
+          Run:
 
             aws sso login --profile {{ aws_profile }}
 
@@ -216,10 +256,208 @@
 
         success_msg: >-
           AWS authentication verified successfully.
-          Lab infrastructure orchestration may proceed.
+          Checking current lab state.
+
+    # ========================================================
+    # 0B. LAB STATE CHECK
+    #
+    # EKS is used as the primary indicator that the reusable
+    # AWS lab is currently online.
+    #
+    # ACTIVE:
+    #   Lab is already running.
+    #   Exit successfully without Terraform or Helm.
+    #
+    # NOT FOUND:
+    #   Lab is down.
+    #   Continue with normal lab startup.
+    #
+    # OTHER STATUS:
+    #   Cluster is transitioning.
+    #   Stop safely.
+    # ========================================================
+
+    - name: Check whether EKS cluster already exists
+      ansible.builtin.command:
+        argv:
+          - aws
+          - eks
+          - describe-cluster
+          - --name
+          - "{{ eks_cluster_name }}"
+          - --region
+          - "{{ aws_region }}"
+          - --profile
+          - "{{ aws_profile }}"
+          - --query
+          - "cluster.status"
+          - --output
+          - text
+      register: eks_lab_status
+      changed_when: false
+      failed_when: false
+
+    # --------------------------------------------------------
+    # Display detected lab state.
+    # --------------------------------------------------------
+
+    - name: Display current AWS lab state
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " AWS LAB STATE CHECK"
+          - "============================================================"
+          - "EKS cluster: {{ eks_cluster_name }}"
+          - >-
+            Status: {{
+              eks_lab_status.stdout | trim
+              if eks_lab_status.rc == 0
+              else 'NOT FOUND'
+            }}
+          - "============================================================"
+
+    # --------------------------------------------------------
+    # Protect against transitional EKS states.
+    #
+    # Do not run Terraform while an existing cluster is
+    # creating, updating or deleting.
+    # --------------------------------------------------------
+
+    - name: Stop when EKS is in a transitional state
+      ansible.builtin.fail:
+        msg: |
+
+          ============================================================
+          AWS LAB IS IN A TRANSITIONAL STATE
+          ============================================================
+
+          EKS cluster: {{ eks_cluster_name }}
+          Status:      {{ eks_lab_status.stdout | trim }}
+
+          The EKS cluster exists but is not ACTIVE.
+
+          Lab-up will not continue while the cluster is
+          transitioning.
+
+          Check again with:
+
+            aws eks describe-cluster \
+              --name {{ eks_cluster_name }} \
+              --region {{ aws_region }} \
+              --profile {{ aws_profile }} \
+              --query 'cluster.status' \
+              --output text
+
+          Wait until the current AWS operation has completed
+          before running lab-up again.
+
+          ============================================================
+
+      when:
+        - eks_lab_status.rc == 0
+        - eks_lab_status.stdout | trim != "ACTIVE"
+
+    # --------------------------------------------------------
+    # Existing ACTIVE EKS cluster means the core lab is
+    # already online.
+    # --------------------------------------------------------
+
+    - name: Report lab is already up
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " AWS LAB IS ALREADY UP"
+          - "============================================================"
+          - "EKS cluster: {{ eks_cluster_name }}"
+          - "Status:      ACTIVE"
+          - ""
+          - "No Terraform or Helm operations are required."
+          - "No infrastructure changes will be made."
+          - ""
+          - "You can proceed with project-up."
+          - "============================================================"
+
+      when:
+        - eks_lab_status.rc == 0
+        - eks_lab_status.stdout | trim == "ACTIVE"
+
+    # --------------------------------------------------------
+    # End successfully.
+    #
+    # This is not an error. The desired state (LAB ON)
+    # has already been achieved.
+    # --------------------------------------------------------
+
+    - name: Stop lab-up because lab is already running
+      ansible.builtin.meta: end_play
+      when:
+        - eks_lab_status.rc == 0
+        - eks_lab_status.stdout | trim == "ACTIVE"
+
+    # ========================================================
+    # 0C. LAB-UP CONFIRMATION
+    #
+    # Reaching this point means an ACTIVE EKS cluster was not
+    # found and the lab needs to be brought online.
+    # ========================================================
+
+    - name: Confirm AWS lab startup
+      ansible.builtin.pause:
+        prompt: |
+
+          ============================================================
+          AWS LAB - STARTUP CONFIRMATION
+          ============================================================
+
+          The reusable AWS lab is currently DOWN.
+
+          This will bring the AWS lab online.
+
+          Deployment order:
+
+            VPC
+              ->
+            EKS
+              ->
+            EKS Pod Identity Agent
+              ->
+            EBS CSI Driver
+              ->
+            Secrets Store CSI Driver
+              ->
+            AWS Secrets Config Provider
+              ->
+            AWS Load Balancer Controller
+
+          Chargeable AWS resources may be created.
+
+          Type LAB-UP to continue.
+          Press Enter to cancel.
+
+      register: lab_up_confirmation
+
+    # --------------------------------------------------------
+    # Cancel safely unless explicitly confirmed.
+    # --------------------------------------------------------
+
+    - name: Stop unless lab startup is confirmed
+      ansible.builtin.fail:
+        msg: |
+
+          ============================================================
+          LAB-UP CANCELLED
+          ============================================================
+
+          No Terraform infrastructure changes were started.
+          ============================================================
+
+      when: lab_up_confirmation.user_input != "LAB-UP"
 
     # ========================================================
     # 1. VPC
+    #
+    # VPC must be applied first because EKS consumes the VPC
+    # Terraform remote-state outputs.
     # ========================================================
 
     - name: Terraform - VPC
@@ -227,11 +465,14 @@
         name: terraform
       vars:
         terraform_working_dir: "{{ terraform_components.vpc }}"
-        terraform_action: "{{ lab_action | default('plan') }}"
+        terraform_action: apply
         terraform_auto_approve: true
 
     # ========================================================
     # 2. EKS
+    #
+    # EKS consumes VPC ID and subnet IDs from the VPC
+    # Terraform remote state.
     # ========================================================
 
     - name: Terraform - EKS
@@ -239,11 +480,13 @@
         name: terraform
       vars:
         terraform_working_dir: "{{ terraform_components.eks }}"
-        terraform_action: "{{ lab_action | default('plan') }}"
+        terraform_action: apply
         terraform_auto_approve: true
 
     # ========================================================
-    # 3. CONFIGURE KUBECTL FOR EKS
+    # 3. CONFIGURE KUBECTL
+    #
+    # EKS must exist before kubeconfig can be configured.
     # ========================================================
 
     - name: Configure kubectl for EKS
@@ -259,11 +502,14 @@
         name: terraform
       vars:
         terraform_working_dir: "{{ terraform_components.pod_identity }}"
-        terraform_action: "{{ lab_action | default('plan') }}"
+        terraform_action: apply
         terraform_auto_approve: true
 
     # ========================================================
     # 5. EBS CSI DRIVER
+    #
+    # Terraform manages the AWS/IAM/Pod Identity portion
+    # according to the existing lab architecture.
     # ========================================================
 
     - name: Terraform - EBS CSI Driver
@@ -271,7 +517,7 @@
         name: terraform
       vars:
         terraform_working_dir: "{{ terraform_components.ebs }}"
-        terraform_action: "{{ lab_action | default('plan') }}"
+        terraform_action: apply
         terraform_auto_approve: true
 
     # ========================================================
@@ -300,7 +546,7 @@
         name: terraform
       vars:
         terraform_working_dir: "{{ terraform_components.aws_load_balancer_controller }}"
-        terraform_action: "{{ lab_action | default('plan') }}"
+        terraform_action: apply
         terraform_auto_approve: true
 
     # ========================================================
@@ -315,3 +561,29 @@
             - alb_controller
       tags:
         - alb_controller
+
+    # ========================================================
+    # 10. FINAL STATUS
+    # ========================================================
+
+    - name: Display successful lab startup
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " AWS LAB IS UP"
+          - "============================================================"
+          - "AWS authentication:              OK"
+          - "VPC:                             APPLIED"
+          - "EKS:                             APPLIED"
+          - "kubectl:                         CONFIGURED"
+          - "EKS Pod Identity Agent:          APPLIED"
+          - "EBS CSI Driver:                  APPLIED"
+          - "Secrets Store CSI Driver:        INSTALLED"
+          - "AWS Secrets Config Provider:     INSTALLED"
+          - "AWS Load Balancer Controller:    INSTALLED"
+          - ""
+          - "Shared AWS lab is ready for project workloads."
+          - ""
+          - "Next:"
+          - "Run project-up from the project repository."
+          - "============================================================"
