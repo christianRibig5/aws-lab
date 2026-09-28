@@ -11,6 +11,11 @@
 #
 # Bootstrap is intentionally excluded because the Terraform
 # state bucket is persistent infrastructure.
+#
+# Authentication:
+#   AWS credentials / SSO are validated before Terraform runs.
+#   If the SSO session has expired, Ansible can launch
+#   `aws sso login` and then continue after authentication.
 # ============================================================
 
 - name: AWS Lab - Terraform Infrastructure
@@ -22,9 +27,201 @@
     - ../group_vars/all.yml
 
   tasks:
+    # ========================================================
+    # 0. AWS AUTHENTICATION PREFLIGHT
+    #
+    # Terraform requires valid AWS credentials even during
+    # `terraform init` because the remote state backend is S3.
+    #
+    # Check authentication before any Terraform component is
+    # initialized.
+    # ========================================================
+
+    - name: Check AWS authentication
+      ansible.builtin.command:
+        argv:
+          - aws
+          - sts
+          - get-caller-identity
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --output
+          - json
+      register: aws_auth_check
+      changed_when: false
+      failed_when: false
+
     # --------------------------------------------------------
+    # AWS session is already valid
+    # --------------------------------------------------------
+
+    - name: Report active AWS session
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " AWS AUTHENTICATION OK"
+          - "============================================================"
+          - "Profile: {{ aws_profile }}"
+          - "Region:  {{ aws_region }}"
+          - "AWS credentials are active."
+          - "Continuing with lab-up."
+          - "============================================================"
+      when: aws_auth_check.rc == 0
+
+    # --------------------------------------------------------
+    # AWS session is expired / unavailable
+    # --------------------------------------------------------
+
+    - name: Report expired AWS session
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " AWS AUTHENTICATION REQUIRED"
+          - "============================================================"
+          - "Profile: {{ aws_profile }}"
+          - "Region:  {{ aws_region }}"
+          - ""
+          - "The AWS session is expired or unavailable."
+          - "AWS SSO authentication is required before Terraform."
+          - "============================================================"
+      when: aws_auth_check.rc != 0
+
+    # --------------------------------------------------------
+    # Ask whether Ansible should launch AWS SSO login.
+    # --------------------------------------------------------
+
+    - name: Ask to authenticate with AWS SSO
+      ansible.builtin.pause:
+        prompt: |
+
+          AWS authentication is not currently valid.
+
+          Ansible can run:
+
+            aws sso login --profile {{ aws_profile }}
+
+          This may open your browser for AWS authentication.
+
+          Type LOGIN to authenticate now.
+          Press Enter to cancel lab-up.
+      register: aws_sso_confirmation
+      when: aws_auth_check.rc != 0
+
+    # --------------------------------------------------------
+    # Stop safely if login was not approved.
+    # --------------------------------------------------------
+
+    - name: Stop when AWS SSO login is declined
+      ansible.builtin.fail:
+        msg: |
+
+          ============================================================
+          LAB-UP CANCELLED
+          ============================================================
+
+          AWS authentication is required.
+
+          You can authenticate manually with:
+
+            aws sso login --profile {{ aws_profile }}
+
+          Then run:
+
+            ansible-playbook playbooks/lab-up.yml
+
+          No lab infrastructure changes were made.
+          ============================================================
+      when:
+        - aws_auth_check.rc != 0
+        - aws_sso_confirmation.user_input | default('') != "LOGIN"
+
+    # --------------------------------------------------------
+    # Launch AWS SSO login.
+    #
+    # AWS CLI controls the browser/device authorization flow.
+    # --------------------------------------------------------
+
+    - name: Login to AWS SSO
+      ansible.builtin.command:
+        argv:
+          - aws
+          - sso
+          - login
+          - --profile
+          - "{{ aws_profile }}"
+      register: aws_sso_login
+      changed_when: false
+      when:
+        - aws_auth_check.rc != 0
+        - aws_sso_confirmation.user_input | default('') == "LOGIN"
+
+    # --------------------------------------------------------
+    # Verify credentials again after login.
+    # --------------------------------------------------------
+
+    - name: Verify AWS authentication after SSO login
+      ansible.builtin.command:
+        argv:
+          - aws
+          - sts
+          - get-caller-identity
+          - --profile
+          - "{{ aws_profile }}"
+          - --region
+          - "{{ aws_region }}"
+          - --output
+          - json
+      register: aws_auth_recheck
+      changed_when: false
+      failed_when: false
+      when: aws_auth_check.rc != 0
+
+    # --------------------------------------------------------
+    # Do not allow Terraform to continue unless authentication
+    # has now been verified.
+    # --------------------------------------------------------
+
+    - name: Validate AWS authentication
+      ansible.builtin.assert:
+        that:
+          - >
+            aws_auth_check.rc == 0 or
+            (
+              aws_auth_recheck is defined and
+              aws_auth_recheck.rc is defined and
+              aws_auth_recheck.rc == 0
+            )
+        fail_msg: |
+
+          ============================================================
+          AWS AUTHENTICATION FAILED
+          ============================================================
+
+          AWS authentication could not be verified.
+
+          Run manually:
+
+            aws sso login --profile {{ aws_profile }}
+
+          Then verify:
+
+            aws sts get-caller-identity \
+              --profile {{ aws_profile }} \
+              --region {{ aws_region }}
+
+          Terraform has NOT been started.
+          ============================================================
+
+        success_msg: >-
+          AWS authentication verified successfully.
+          Lab infrastructure orchestration may proceed.
+
+    # ========================================================
     # 1. VPC
-    # --------------------------------------------------------
+    # ========================================================
+
     - name: Terraform - VPC
       ansible.builtin.include_role:
         name: terraform
@@ -33,9 +230,10 @@
         terraform_action: "{{ lab_action | default('plan') }}"
         terraform_auto_approve: true
 
-    # --------------------------------------------------------
+    # ========================================================
     # 2. EKS
-    # --------------------------------------------------------
+    # ========================================================
+
     - name: Terraform - EKS
       ansible.builtin.include_role:
         name: terraform
@@ -44,16 +242,18 @@
         terraform_action: "{{ lab_action | default('plan') }}"
         terraform_auto_approve: true
 
-    # --------------------------------------------------------
-    # 3. Configure kubectl for EKS
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. CONFIGURE KUBECTL FOR EKS
+    # ========================================================
+
     - name: Configure kubectl for EKS
       ansible.builtin.include_role:
         name: eks_kubeconfig
 
-    # --------------------------------------------------------
-    # 4. EKS Pod Identity Agent
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. EKS POD IDENTITY AGENT
+    # ========================================================
+
     - name: Terraform - EKS Pod Identity Agent
       ansible.builtin.include_role:
         name: terraform
@@ -62,9 +262,10 @@
         terraform_action: "{{ lab_action | default('plan') }}"
         terraform_auto_approve: true
 
-    # --------------------------------------------------------
-    # 5. EBS CSI Driver
-    # --------------------------------------------------------
+    # ========================================================
+    # 5. EBS CSI DRIVER
+    # ========================================================
+
     - name: Terraform - EBS CSI Driver
       ansible.builtin.include_role:
         name: terraform
@@ -73,34 +274,39 @@
         terraform_action: "{{ lab_action | default('plan') }}"
         terraform_auto_approve: true
 
-    # --------------------------------------------------------
-    # 6. Secrets Store CSI Driver - Helm
-    # --------------------------------------------------------
+    # ========================================================
+    # 6. SECRETS STORE CSI DRIVER - HELM
+    # ========================================================
+
     - name: Install Secrets Store CSI Driver
       ansible.builtin.include_role:
         name: secrets_store_csi
 
-    # --------------------------------------------------------
-    # 7. AWS Secrets Config Provider (ASCP) - Helm
-    # --------------------------------------------------------
+    # ========================================================
+    # 7. AWS SECRETS CONFIG PROVIDER (ASCP) - HELM
+    # ========================================================
+
     - name: Install AWS Secrets Config Provider
       ansible.builtin.include_role:
         name: ascp
 
-    # --------------------------------------------------------
-    # 8. AWS Load Balancer Controller - IAM and Pod Identity
-    # --------------------------------------------------------
+    # ========================================================
+    # 8. AWS LOAD BALANCER CONTROLLER
+    #    IAM + POD IDENTITY
+    # ========================================================
+
     - name: Terraform - AWS Load Balancer Controller
       ansible.builtin.include_role:
         name: terraform
       vars:
         terraform_working_dir: "{{ terraform_components.aws_load_balancer_controller }}"
-        terraform_action: "{{ lab_action }}"
+        terraform_action: "{{ lab_action | default('plan') }}"
         terraform_auto_approve: true
 
-    # --------------------------------------------------------
-    # 9. AWS Load Balancer Controller - Helm
-    # --------------------------------------------------------
+    # ========================================================
+    # 9. AWS LOAD BALANCER CONTROLLER - HELM
+    # ========================================================
+
     - name: Install AWS Load Balancer Controller
       ansible.builtin.include_role:
         name: aws_load_balancer_controller
